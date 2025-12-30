@@ -22,12 +22,20 @@ from typing import Callable, TypedDict
 
 
 class Config(TypedDict):
-    parent_dir: Path
+    parent_dirs: list[Path]
     depth: int
     fzf_options: list[str]
     fzf_preview: str
     tmux_session_factory: Callable[[str, Path], list[list[str]]]
     allowed_dotfiles: list[str]
+
+
+class ColonSeparatedPaths:
+    def __init__(self, paths: str):
+        self.paths = [Path(p) for p in paths.split(":")]
+
+    def __iter__(self):
+        return self.paths.__iter__()
 
 
 def detect_env_activation(path: Path) -> None | list[str]:
@@ -117,9 +125,12 @@ def standard_tmux_session(session_name: str, path: Path) -> list[list[str]]:
 
 
 CONFIG: Config = {
-    "parent_dir": Path(
-        os.getenv("TMUX_SESSIONIZER_PARENT_DIR", os.getenv("HOME", "."))
-    ).resolve(),
+    "parent_dirs": [
+        Path(p).resolve()
+        for p in os.getenv(
+            "TMUX_SESSIONIZER_PARENT_DIRS", os.getenv("HOME", ".")
+        ).split(":")
+    ],
     "depth": 2,
     "fzf_options": ["--cycle"],
     "fzf_preview": "eza --color=always --icons --group-directories-first --git-ignore -T -L 2",
@@ -129,34 +140,35 @@ CONFIG: Config = {
 
 
 def find_project_dirs(
-    path: Path, depth: int, acc: None | list[Path] = None
+    paths: ColonSeparatedPaths, depth: int, acc: None | list[Path] = None
 ) -> list[Path]:
     if acc is None:
         acc = []
     if depth < 0:
         return acc
 
-    if path.is_symlink():
-        # Don't follow symlinks, or we can get weird recursions
-        acc.append(path)
-        return acc
-
-    if path.is_dir():
-        # print(f"Searching in {path}...")
-        # Check if the path starts with .:
-        if path.name.startswith("."):
+    for path in paths:
+        if path.is_symlink():
+            # Don't follow symlinks, or we can get weird recursions
             acc.append(path)
-            # if path.name in CONFIG["allowed_dotfiles"]:
-            #     find_project_dirs(path, 1, acc)  # don't go much deeper
             return acc
 
-        # Path does not start with a dot. So we add it to the list and continue searching:
-        acc.append(path)
-        if path_is_git_repo(path):
-            # Don't go any deeper
-            return acc
-        for child in path.iterdir():
-            find_project_dirs(child, depth - 1, acc)
+        if path.is_dir():
+            # print(f"Searching in {path}...")
+            # Check if the path starts with .:
+            if path.name.startswith("."):
+                acc.append(path)
+                # if path.name in CONFIG["allowed_dotfiles"]:
+                #     find_project_dirs(path, 1, acc)  # don't go much deeper
+                return acc
+
+            # Path does not start with a dot. So we add it to the list and continue searching:
+            acc.append(path)
+            if path_is_git_repo(path):
+                # Don't go any deeper
+                return acc
+            for child in path.iterdir():
+                find_project_dirs(ColonSeparatedPaths(str(child)), depth - 1, acc)
     return acc
 
 
@@ -207,47 +219,100 @@ def start_standard_tmux_session(session_name: str, path: Path) -> None:
         subprocess.run(cmd, check=True)
 
 
-def send_list_of_paths_to_fzf(paths: list[Path], parent_dir: Path) -> Path | None:
-    # Remove duplicates:
-    paths = sorted(list(set(paths)), key=lambda x: str(x))
-    # Trim the parent directory from the paths
-    paths = [path.relative_to(parent_dir) for path in paths]
+def send_list_of_paths_to_fzf(
+    paths: list[Path], parent_dirs: ColonSeparatedPaths
+) -> Path | None:
+    # Deduplicate & normalize
+    paths = sorted({p.resolve() for p in paths})
+
+    # Build a display -> real path mapping
+    display_to_real: dict[str, Path] = {}
+
+    for path in paths:
+        for parent in parent_dirs:
+            try:
+                rel = path.relative_to(parent)
+                display = f"{parent.name}/{rel}"
+                display_to_real[display] = path
+                break
+            except ValueError:
+                continue
+        else:
+            # Path didn't match any parent; fallback to absolute
+            display_to_real[str(path)] = path
+
     fzf_cmd = ["fzf"]
     if CONFIG["fzf_options"]:
         fzf_cmd.extend(CONFIG["fzf_options"])
+
     if CONFIG["fzf_preview"]:
         fzf_cmd.extend(
             [
                 "--preview",
-                f"{CONFIG['fzf_preview']} {parent_dir}/{{}}",
+                f"{CONFIG['fzf_preview']} {{}}",
             ]
         )
 
     result = subprocess.run(
         fzf_cmd,
-        input="\n".join(map(str, paths)).encode(),
+        input="\n".join(display_to_real.keys()).encode(),
         capture_output=True,
     )
 
     if result.returncode == 0:
-        selected_path = parent_dir / Path(result.stdout.decode().strip())
-        if selected_path.is_dir():
-            return selected_path.resolve()
-    elif result.returncode == 130:
-        # User cancelled out of fzf:
+        selected = result.stdout.decode().strip()
+        return display_to_real[selected]
+
+    if result.returncode == 130:
         print("fzf selection cancelled.")
         return None
-    else:
-        print(
-            "Some unknown error occurrsed during the fzf selection. fzf exited with code: ",
-            result.returncode,
-        )
-        print(" === Output: ===\n", result.stdout.decode(), "\n === End of output ===")
-        print(" === Error: ===\n", result.stderr.decode(), "\n === End of error ===")
 
-    raise ValueError(
-        "No valid directory selected. Do you have fzf installed and in your PATH?"
-    )
+    print("fzf exited with code:", result.returncode)
+    print(result.stderr.decode())
+    raise RuntimeError("fzf failed unexpectedly")
+
+
+# def send_list_of_paths_to_fzf(paths: list[Path], parent_dirs: ColonSeparatedPaths) -> Path | None:
+#     # Remove duplicates:
+#     paths = sorted(list(set(paths)), key=lambda x: str(x))
+#     # Trim the parent directory from the paths
+#     paths = [path.relative_to(parent_dir) for path in paths]
+#     fzf_cmd = ["fzf"]
+#     if CONFIG["fzf_options"]:
+#         fzf_cmd.extend(CONFIG["fzf_options"])
+#     if CONFIG["fzf_preview"]:
+#         fzf_cmd.extend(
+#             [
+#                 "--preview",
+#                 f"{CONFIG['fzf_preview']} {parent_dir}/{{}}",
+#             ]
+#         )
+#
+#     result = subprocess.run(
+#         fzf_cmd,
+#         input="\n".join(map(str, paths)).encode(),
+#         capture_output=True,
+#     )
+#
+#     if result.returncode == 0:
+#         selected_path = parent_dir / Path(result.stdout.decode().strip())
+#         if selected_path.is_dir():
+#             return selected_path.resolve()
+#     elif result.returncode == 130:
+#         # User cancelled out of fzf:
+#         print("fzf selection cancelled.")
+#         return None
+#     else:
+#         print(
+#             "Some unknown error occurrsed during the fzf selection. fzf exited with code: ",
+#             result.returncode,
+#         )
+#         print(" === Output: ===\n", result.stdout.decode(), "\n === End of output ===")
+#         print(" === Error: ===\n", result.stderr.decode(), "\n === End of error ===")
+#
+#     raise ValueError(
+#         "No valid directory selected. Do you have fzf installed and in your PATH?"
+#     )
 
 
 def attach_to_tmux_session(session_name: str) -> None:
@@ -261,9 +326,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-p",
-        "--parent-dir",
-        type=Path,
-        default=CONFIG["parent_dir"],
+        "--parent-dirs",
+        type=ColonSeparatedPaths,
+        default=CONFIG["parent_dirs"],
         help="Parent directory to search for subdirectories.",
     )
     parser.add_argument(
@@ -347,15 +412,16 @@ def main() -> int:
             # Start a tmux session in the specified directory:
             return find_session_or_start_then_attach(path)
 
-    parent_dir = args.parent_dir.resolve()
-    if not parent_dir.is_dir():
-        raise ValueError(f"{parent_dir} is not a valid directory.")
+    parent_dirs: ColonSeparatedPaths = args.parent_dirs
+    for parent_dir in parent_dirs:
+        if not parent_dir.is_dir():
+            raise ValueError(f"{parent_dir} is not a valid directory.")
 
     # Find all subdirectories and fuzzy find:
-    project_dirs = find_project_dirs(parent_dir, args.depth)
+    project_dirs = find_project_dirs(parent_dirs, args.depth)
     if not project_dirs:
-        raise ValueError(f"No subdirectories found in {parent_dir}.")
-    selected_path = send_list_of_paths_to_fzf(project_dirs, parent_dir)
+        raise ValueError(f"No subdirectories found in {parent_dirs}.")
+    selected_path = send_list_of_paths_to_fzf(project_dirs, parent_dirs)
     if selected_path is None:
         print("No directory selected. Exiting.")
         return 1
